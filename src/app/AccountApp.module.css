@@ -1,0 +1,56 @@
+.page {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.panel {
+  width: min(100%, 360px);
+}
+
+.panel h1 {
+  margin: 0 0 28px;
+  font-size: 32px;
+  letter-spacing: -0.03em;
+}
+
+.form,
+.form label {
+  display: grid;
+  gap: 8px;
+}
+
+.form {
+  gap: 16px;
+}
+
+.form input {
+  min-width: 0;
+  border: 1px solid var(--ds-input-border, #888);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  padding: 10px 12px;
+  font: inherit;
+}
+
+.form input:focus-visible {
+  outline: 2px solid var(--ds-primary, #4d6bfe);
+  outline-offset: 2px;
+}
+
+.toggle {
+  margin-top: 16px;
+  color: inherit;
+  text-decoration: underline;
+  background: transparent;
+  border: 0;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.error {
+  margin: 0;
+  color: var(--ds-negative, #c33);
+}

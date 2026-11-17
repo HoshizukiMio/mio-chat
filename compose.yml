@@ -1,0 +1,17 @@
+services:
+  mio-chat:
+    build: .
+    environment:
+      NODE_ENV: production
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to the HTTPS address}
+      REGISTRATION_MODE: ${REGISTRATION_MODE:-invite}
+      MIO_ENCRYPTION_KEY: ${MIO_ENCRYPTION_KEY:?Set MIO_ENCRYPTION_KEY}
+      TRUST_PROXY: ${TRUST_PROXY:-}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - mio-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  mio-data:

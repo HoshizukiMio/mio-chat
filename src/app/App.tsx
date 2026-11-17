@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslate } from '../i18n/index.js'
 import { useSettings } from '../services/settings.js'
 import { useIsMobile, useMobileViewport, usePreventPageScroll } from './viewport.js'
@@ -20,6 +20,7 @@ import { Toast } from '../components/base/Toast.js'
 import { showToast } from '../components/base/toastState.js'
 import { onUploadNotice } from '../services/attachments.js'
 import { Button } from '../components/base/Button.js'
+import { Modal } from '../components/base/Modal.js'
 import { stopReadAloud } from '../services/speech/readAloud.js'
 import { CollapsedSider } from '../components/sider/CollapsedSider.js'
 import { closeMobileSider } from '../components/sider/mobileSiderState.js'
@@ -29,12 +30,18 @@ import styles from './App.module.css'
 export const App = () => {
   const t = useTranslate()
   const isMobile = useIsMobile()
-  const locale = useSettings((state) => state.locale)
   // 移动端侧边栏以独立抽屉管理开合状态
   const siderCollapsed = useSettings((state) => state.siderCollapsed) && !isMobile
   const ready = useChatStore((state) => state.ready)
   const initError = useChatStore((state) => state.initError)
   const saveError = useChatStore((state) => Object.values(state.sessionSaveErrors).some(Boolean))
+  const conflict = useChatStore((state) =>
+    Object.values(state.sessionSaveErrors).includes('conflict')
+  )
+  const retryable = useChatStore((state) =>
+    Object.values(state.sessionSaveErrors).includes('failed')
+  )
+  const [confirmReload, setConfirmReload] = useState(false)
   const importingHistory = useChatStore((state) => state.importingHistory)
   const session = useChatStore((state) =>
     state.activeId !== null && Object.hasOwn(state.sessionCache, state.activeId)
@@ -51,10 +58,6 @@ export const App = () => {
   const activeId = useChatStore((state) => state.activeId)
 
   usePreventPageScroll(isMobile)
-
-  useEffect(() => {
-    document.documentElement.lang = locale
-  }, [locale])
 
   // 文件数、存储空间达到上限时，附件上只显示「上传失败」，原因用 toast 说明
   useEffect(() => onUploadNotice(showToast), [])
@@ -80,15 +83,27 @@ export const App = () => {
         <main className={styles.main}>
           {saveError ? (
             <div className={styles.saveError} role="alert">
-              <span>{t('sessionSaveFailed')}</span>
-              <Button
-                variant="outlined"
-                size="s"
-                disabled={importingHistory}
-                onClick={retrySaveSessions}
-              >
-                {t('retry')}
-              </Button>
+              <span>{t(conflict ? 'sessionSaveConflict' : 'sessionSaveFailed')}</span>
+              {conflict ? (
+                <Button
+                  variant="outlined"
+                  size="s"
+                  disabled={importingHistory}
+                  onClick={() => setConfirmReload(true)}
+                >
+                  {t('sessionReload')}
+                </Button>
+              ) : null}
+              {retryable ? (
+                <Button
+                  variant="outlined"
+                  size="s"
+                  disabled={importingHistory}
+                  onClick={retrySaveSessions}
+                >
+                  {t('retry')}
+                </Button>
+              ) : null}
             </div>
           ) : null}
           <div className={styles.content}>
@@ -133,6 +148,22 @@ export const App = () => {
         <SearchPanel />
       </div>
       <SettingsDialog />
+      {confirmReload ? (
+        <Modal
+          title={t('sessionReload')}
+          onClose={() => setConfirmReload(false)}
+          footer={
+            <>
+              <Button variant="outlined" onClick={() => setConfirmReload(false)}>
+                {t('cancel')}
+              </Button>
+              <Button onClick={() => window.location.reload()}>{t('sessionReload')}</Button>
+            </>
+          }
+        >
+          {t('sessionReloadConfirm')}
+        </Modal>
+      ) : null}
       <Toast />
     </>
   )

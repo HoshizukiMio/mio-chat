@@ -117,13 +117,7 @@ const next = () => {
 }
 
 /** 排队上传，最多同时上传 MAX_CONCURRENT 个；排队期间中止的任务不会发出请求 */
-const enqueueUpload = (
-  apiKey: string,
-  file: Blob,
-  name: string,
-  isImage: boolean,
-  signal: AbortSignal
-) =>
+const enqueueUpload = (file: Blob, name: string, isImage: boolean, signal: AbortSignal) =>
   new Promise<string>((resolve, reject) => {
     queue.push(async () => {
       if (signal.aborted) {
@@ -132,7 +126,7 @@ const enqueueUpload = (
       }
       try {
         const body = file instanceof File ? file : new File([file], name, { type: file.type })
-        resolve((await uploadFile(apiKey, body, getUploadPurpose(name, isImage), signal)).id)
+        resolve((await uploadFile(body, getUploadPurpose(name, isImage), signal)).id)
       } catch (error) {
         reject(error)
       }
@@ -165,7 +159,6 @@ const pending = new Map<string, { promise: Promise<string>; controller: AbortCon
 
 /** 开始（或复用进行中的）上传，返回服务端 file_id；失败时任务记为 error 并抛出原错误 */
 export const uploadAttachment = (
-  apiKey: string,
   id: string,
   blob: Blob,
   name: string,
@@ -177,12 +170,16 @@ export const uploadAttachment = (
   }
   const controller = new AbortController()
   setTask(id, { status: 'uploading' })
-  const promise = enqueueUpload(apiKey, blob, name, isImage, controller.signal)
+  const promise = enqueueUpload(blob, name, isImage, controller.signal)
     .then((serverId) => {
+      controller.signal.throwIfAborted()
       setTask(id, { status: 'done', serverId })
       return serverId
     })
     .catch((error: unknown) => {
+      if (pending.get(id)?.controller !== controller) {
+        throw error
+      }
       if (controller.signal.aborted) {
         setTask(id, null)
       } else {
@@ -200,14 +197,27 @@ export const uploadAttachment = (
       }
       throw error
     })
-    .finally(() => pending.delete(id))
+    .finally(() => {
+      if (pending.get(id)?.controller === controller) {
+        pending.delete(id)
+      }
+    })
   pending.set(id, { promise, controller })
   return promise
 }
 
 export const cancelUpload = (id: string) => {
   pending.get(id)?.controller.abort()
+  pending.delete(id)
   setTask(id, null)
+}
+
+export const resetUploads = () => {
+  for (const { controller } of pending.values()) {
+    controller.abort()
+  }
+  pending.clear()
+  useUploads.setState({ tasks: {} })
 }
 
 /** 各扩展名对应的 MIME：部分系统（如 Windows）给不出 file.type，按扩展名补齐 */

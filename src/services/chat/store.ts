@@ -3,8 +3,15 @@ import { createId } from '../../utils/id.js'
 import { ApiError, streamMessage } from '../api/client.js'
 import type { ChatModel, CreateMessageRequest } from '../api/types.js'
 import { extractFileIds, getFileErrorCode, isRetryableApiError } from '../api/errors.js'
-import { cancelUpload, describeUploadError, uploadAttachment, useUploads } from '../attachments.js'
+import {
+  cancelUpload,
+  describeUploadError,
+  resetUploads,
+  uploadAttachment,
+  useUploads,
+} from '../attachments.js'
 import { useSettings } from '../settings.js'
+import { MioError } from '../account.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
 import * as db from './db.js'
 import {
@@ -68,14 +75,14 @@ type ChatState = {
   sessions: SessionSummary[]
   sessionCache: Record<string, Session>
   sessionLoadErrors: Record<string, boolean>
-  sessionSaveErrors: Record<string, boolean>
+  sessionSaveErrors: Record<string, 'failed' | 'conflict'>
   /** null 表示新对话（欢迎页） */
   activeId: string | null
   /** 正在生成回复的会话 */
   streaming: Record<string, AbortController>
 }
 
-export const useChatStore = create<ChatState>(() => ({
+const initialChat = (): ChatState => ({
   ready: false,
   initError: false,
   importingHistory: false,
@@ -85,7 +92,8 @@ export const useChatStore = create<ChatState>(() => ({
   sessionSaveErrors: {},
   activeId: null,
   streaming: {},
-}))
+})
+export const useChatStore = create<ChatState>(initialChat)
 
 const { getState: get, setState: set } = useChatStore
 
@@ -109,6 +117,7 @@ const sessionAccess = new Map<string, number>()
 const unsavedSessions = new Set<string>()
 /** 保存失败时保留原件，重试成功后才释放。 */
 const pendingFiles = new Map<string, db.StoredFile[]>()
+const pendingRenames = new Map<string, string>()
 const deletingSessions = new Set<string>()
 const deletionTasks = new Set<Promise<boolean>>()
 const streamFlushes = new Map<string, () => void>()
@@ -179,48 +188,62 @@ const updateReply = (sessionId: string, reply: AssistantMessage) =>
     ),
   }))
 
-const persist = (sessionId: string) => {
+const saveError = (sessionId: string, error: unknown) => {
+  set((state) => ({
+    sessionSaveErrors: {
+      ...state.sessionSaveErrors,
+      [sessionId]: db.isConflict(error) ? 'conflict' : 'failed',
+    },
+  }))
+}
+
+const clearSaveError = (sessionId: string) =>
+  set((state) => ({
+    sessionSaveErrors: Object.fromEntries(
+      Object.entries(state.sessionSaveErrors).filter(([id]) => id !== sessionId)
+    ),
+  }))
+
+const persist = async (sessionId: string): Promise<boolean> => {
   const session = getSession(sessionId)
-  if (session) {
-    unsavedSessions.add(sessionId)
-    if (deletingSessions.has(sessionId)) {
-      return
+  if (!session) {
+    return false
+  }
+  unsavedSessions.add(sessionId)
+  if (deletingSessions.has(sessionId) || get().sessionSaveErrors[sessionId] === 'conflict') {
+    return false
+  }
+  const epoch = historyEpoch
+  const files = pendingFiles.get(sessionId)
+  try {
+    await db.saveSession(session, files)
+    if (epoch !== historyEpoch || !getSession(sessionId)) {
+      return false
     }
-    const epoch = historyEpoch
-    const files = pendingFiles.get(sessionId)
-    void db
-      .saveSession(session, files)
-      .then(() => {
-        if (epoch !== historyEpoch || !getSession(sessionId)) {
-          return
-        }
-        if (pendingFiles.get(sessionId) === files) {
-          pendingFiles.delete(sessionId)
-        }
-        if (getSession(sessionId) === session) {
-          unsavedSessions.delete(sessionId)
-          set((state) => ({
-            sessionSaveErrors: Object.fromEntries(
-              Object.entries(state.sessionSaveErrors).filter(([id]) => id !== sessionId)
-            ),
-          }))
-          trimSessionCache()
-        }
-      })
-      .catch((error: unknown) => {
-        db.reportStorageError('save session')(error)
-        if (epoch === historyEpoch && getSession(sessionId)) {
-          set((state) => ({
-            sessionSaveErrors: { ...state.sessionSaveErrors, [sessionId]: true },
-          }))
-        }
-      })
+    if (pendingFiles.get(sessionId) === files) {
+      pendingFiles.delete(sessionId)
+    }
+    if (getSession(sessionId) === session) {
+      unsavedSessions.delete(sessionId)
+      clearSaveError(sessionId)
+      trimSessionCache()
+    }
+    return true
+  } catch (error) {
+    db.reportStorageError('save session')(error)
+    if (epoch === historyEpoch && getSession(sessionId)) {
+      saveError(sessionId, error)
+    }
+    return false
   }
 }
 
 export const retrySaveSessions = () => {
   if (!get().importingHistory) {
     unsavedSessions.forEach(persist)
+    for (const [id, title] of pendingRenames) {
+      void persistRename(id, title)
+    }
   }
 }
 
@@ -232,11 +255,13 @@ export const bindChatPersistence = () => {
     }
     for (const [id, flush] of streamFlushes) {
       flush()
-      persist(id)
+      if (!db.hasPendingWrite(id)) {
+        void persist(id)
+      }
     }
     for (const id of unsavedSessions) {
-      if (!streamFlushes.has(id)) {
-        persist(id)
+      if (!streamFlushes.has(id) && !db.hasPendingWrite(id)) {
+        void persist(id)
       }
     }
   }
@@ -247,9 +272,11 @@ export const bindChatPersistence = () => {
   }
   document.addEventListener('visibilitychange', onVisibilityChange)
   window.addEventListener('pagehide', save)
+  window.addEventListener('online', retrySaveSessions)
   return () => {
     document.removeEventListener('visibilitychange', onVisibilityChange)
     window.removeEventListener('pagehide', save)
+    window.removeEventListener('online', retrySaveSessions)
   }
 }
 
@@ -306,7 +333,7 @@ export const initChat = (): Promise<void> => {
     } catch (error) {
       if (epoch === historyEpoch) {
         set({ initError: true })
-        db.reportStorageError('read local sessions')(error)
+        db.reportStorageError('read server sessions')(error)
       }
     } finally {
       if (epoch === historyEpoch) {
@@ -341,20 +368,26 @@ const ensureSessionLoaded = (id: string): Promise<void> => {
         return
       }
       if (!stored) {
-        throw new Error(`Session ${id} is missing from local storage`)
+        throw new MioError(409, 'conflict', 'This session no longer exists')
       }
       const settled = settleInterrupted(normalizeSession(stored))
       // 读取期间可能已在列表重命名，保留最新元数据，不能让旧读取覆盖它。
-      const session = sameSummary(settled, summary) ? settled : { ...settled, ...summary }
+      const currentTitle = pendingRenames.get(id)
+      const session = currentTitle === undefined ? settled : { ...settled, title: currentTitle }
       touchSession(id)
-      set((state) => ({ sessionCache: { ...state.sessionCache, [id]: session } }))
-      if (session !== stored) {
-        persist(id)
-      }
+      set((state) => ({
+        sessionCache: { ...state.sessionCache, [id]: session },
+        sessions: sortSessions(
+          state.sessions.map((item) => (item.id === id ? toSessionSummary(session) : item))
+        ),
+      }))
       trimSessionCache()
     } catch (error) {
       if (epoch === historyEpoch && sessionLoads.get(id) === load) {
         set((state) => ({ sessionLoadErrors: { ...state.sessionLoadErrors, [id]: true } }))
+        if (db.isConflict(error)) {
+          saveError(id, error)
+        }
         db.reportStorageError('read session')(error)
       }
     } finally {
@@ -389,34 +422,51 @@ const waitForIdle = (sessionId?: string) =>
  * 替换历史对话：先写入暂存，成功后原子替换旧记录；写入为空即删除全部会话与附件。
  * 期间停止生成并禁止修改会话；失败时清除暂存，保留原有记录。
  */
-export const replaceHistory = async (write: () => Promise<void>): Promise<number> => {
+export const replaceHistory = async (
+  write: (staging: db.HistoryStaging) => Promise<void>
+): Promise<number> => {
   if (get().importingHistory) {
     throw new Error('History replacement is already in progress')
   }
   set({ importingHistory: true })
+  const accountStorage = historyEpoch
+  let epoch = accountStorage
   try {
     for (const controller of Object.values(get().streaming)) {
       controller.abort()
     }
     // 已开始的单条删除先同步到内存，避免本次替换失败后列表残留已被删除的记录。
     await Promise.all(deletionTasks)
+    if (accountStorage !== historyEpoch) {
+      throw new DOMException('Signed out', 'AbortError')
+    }
     historyEpoch += 1
+    epoch = historyEpoch
     initTask = undefined
     sessionLoads.clear()
     await waitForIdle()
-    await db.clearStaging()
+    await db.waitForWrites()
+    if (epoch !== historyEpoch) {
+      throw new DOMException('Signed out', 'AbortError')
+    }
+    const staging = await db.beginReplacement()
     let summaries: SessionSummary[]
     try {
-      await write()
-      summaries = await db.commitStaging()
+      await write(staging)
+      summaries = await staging.commit()
     } catch (error) {
-      await db.clearStaging().catch(db.reportStorageError('clear unfinished history replacement'))
+      await staging.cancel().catch(db.reportStorageError('clear unfinished history replacement'))
       throw error
+    }
+    if (epoch !== historyEpoch) {
+      throw new DOMException('Signed out', 'AbortError')
     }
     sessionAccess.clear()
     unsavedSessions.clear()
     pendingFiles.clear()
+    pendingRenames.clear()
     clearAllDrafts()
+    resetUploads()
     set({
       ready: true,
       initError: false,
@@ -428,14 +478,54 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
     })
     return summaries.length
   } finally {
-    set({ importingHistory: false })
-    retrySaveSessions()
-    const { activeId, ready } = get()
-    // 替换失败时恢复被取消的详情读取，原有记录继续可用。
-    if (activeId !== null) {
-      void ensureSessionLoaded(activeId)
-    } else if (!ready) {
-      void initChat()
+    if (epoch === historyEpoch) {
+      set({ importingHistory: false })
+      retrySaveSessions()
+      const { activeId, ready } = get()
+      if (activeId !== null) {
+        void ensureSessionLoaded(activeId)
+      } else if (!ready) {
+        void initChat()
+      }
+    }
+  }
+}
+
+export const resetChat = () => {
+  historyEpoch += 1
+  for (const controller of Object.values(get().streaming)) {
+    controller.abort()
+  }
+  titleRequests.clear()
+  streamFlushes.clear()
+  sessionAccess.clear()
+  sessionLoads.clear()
+  unsavedSessions.clear()
+  pendingFiles.clear()
+  pendingRenames.clear()
+  deletingSessions.clear()
+  deletionTasks.clear()
+  initTask = undefined
+  clearAllDrafts()
+  resetUploads()
+  db.resetStorage()
+  set(initialChat())
+}
+
+const persistRename = async (id: string, title: string) => {
+  if (get().sessionSaveErrors[id] === 'conflict') {
+    return
+  }
+  const epoch = historyEpoch
+  try {
+    await db.renameSession(id, title)
+    if (epoch === historyEpoch && pendingRenames.get(id) === title) {
+      pendingRenames.delete(id)
+      clearSaveError(id)
+    }
+  } catch (error) {
+    if (epoch === historyEpoch && pendingRenames.get(id) === title) {
+      saveError(id, error)
     }
   }
 }
@@ -473,7 +563,8 @@ export const renameSession = (id: string, title: string) => {
         session.id === id ? { ...session, title } : session
       ),
     }))
-    void db.renameSession(id, title).catch(db.reportStorageError('rename session'))
+    pendingRenames.set(id, title)
+    void persistRename(id, title)
   }
 }
 
@@ -507,7 +598,9 @@ const removeSessionData = async (id: string): Promise<boolean> => {
     sessionLoads.delete(id)
     sessionAccess.delete(id)
     unsavedSessions.delete(id)
+    db.discardLocalFiles(pendingFiles.get(id))
     pendingFiles.delete(id)
+    pendingRenames.delete(id)
     clearDraft(id)
     set((state) => ({
       sessions: state.sessions.filter((session) => session.id !== id),
@@ -525,11 +618,16 @@ const removeSessionData = async (id: string): Promise<boolean> => {
     return true
   } catch (error) {
     db.reportStorageError('delete session')(error)
+    if (epoch === historyEpoch && db.isConflict(error)) {
+      saveError(id, error)
+    }
     return false
   } finally {
-    deletingSessions.delete(id)
+    if (epoch === historyEpoch) {
+      deletingSessions.delete(id)
+    }
     // 删除失败时保留会话，并保存停止生成后的最新状态。
-    if (getSession(id)) {
+    if (epoch === historyEpoch && getSession(id)) {
       if (get().importingHistory) {
         unsavedSessions.add(id)
       } else {
@@ -609,7 +707,6 @@ export const sendMessage = (targetSessionId: string | null) => {
       ...files.map(({ id, blob }) => ({ id, blob })),
     ])
   }
-  persist(sessionId)
   clearSentDraft(targetSessionId)
   void streamReply(sessionId, reply, { history, question })
   return true
@@ -637,7 +734,6 @@ export const regenerateReply = (sessionId: string, messageId?: string) => {
     ...appendBranch(s, question.id, [reply]),
     updatedAt: Date.now(),
   }))
-  persist(sessionId)
   void streamReply(sessionId, reply, { history, question })
 }
 
@@ -669,7 +765,6 @@ export const editMessage = (sessionId: string, messageId: string, content: strin
     ...appendBranch(s, path[index - 1]?.id ?? null, [question, reply]),
     updatedAt: Date.now(),
   }))
-  persist(sessionId)
   void streamReply(sessionId, reply, { history: path.slice(0, index), question })
   return true
 }
@@ -719,7 +814,6 @@ export const continueReply = (sessionId: string, messageId: string) => {
   }
   updateReply(sessionId, reply)
   updateSession(sessionId, (s) => ({ ...s, updatedAt: Date.now() }))
-  persist(sessionId)
   void streamReply(sessionId, reply, { history: path.slice(0, -2), question, prefix: previous })
 }
 
@@ -745,7 +839,6 @@ export const retryUpload = (sessionId: string, messageId: string) => {
   }
   const reply: AssistantMessage = { ...previous, status: 'pending', error: undefined }
   updateReply(sessionId, reply)
-  persist(sessionId)
   void streamReply(sessionId, reply, { history: path.slice(0, index - 1), question })
 }
 
@@ -776,7 +869,7 @@ const saveServerIds = (sessionId: string, serverIds: Map<string, string>) => {
  * 附件的服务端 id：已有直接用；正在上传的等待同一任务；否则读取本地原件补传。
  * 本地也没有原件（导入的文档附件只有元数据）时返回 null，该附件只展示、不进入请求。
  */
-const ensureServerId = async (apiKey: string, file: FileAttachment): Promise<string | null> => {
+const ensureServerId = async (file: FileAttachment): Promise<string | null> => {
   if (file.serverId) {
     return file.serverId
   }
@@ -788,7 +881,7 @@ const ensureServerId = async (apiKey: string, file: FileAttachment): Promise<str
   if (!blob) {
     return null
   }
-  return uploadAttachment(apiKey, file.id, blob, file.name, file.isImage)
+  return uploadAttachment(file.id, blob, file.name, file.isImage)
 }
 
 /** 用会话里的最新消息替换请求快照：重传前会重置附件的 serverId，快照必须跟着更新 */
@@ -818,7 +911,6 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
   // 服务端判定 file_id 失效时会清掉会话里的 serverId，先用最新消息替换请求快照，
   // 否则快照里仍是旧 id，补传会直接复用它。
   request = refreshRequest(sessionId, request)
-  const apiKey = useSettings.getState().apiKey ?? ''
   const serverIds = new Map<string, string>()
   // 停止生成立即生效；上传本身不取消（输入框与其他消息可能共用同一任务），完成后照常写回 serverId
   const aborted = new Promise<never>((_, reject) => {
@@ -826,7 +918,7 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
   })
   const uploads = Promise.allSettled(
     request.question.files.map(async (file) => {
-      const serverId = await ensureServerId(apiKey, file)
+      const serverId = await ensureServerId(file)
       if (serverId) {
         serverIds.set(file.id, serverId)
       }
@@ -854,7 +946,7 @@ const prepareFiles = async (sessionId: string, request: Request, signal: AbortSi
   for (const file of pending.values()) {
     signal.throwIfAborted()
     try {
-      const serverId = await Promise.race([ensureServerId(apiKey, file), aborted])
+      const serverId = await Promise.race([ensureServerId(file), aborted])
       if (serverId) {
         serverIds.set(file.id, serverId)
         saveServerIds(sessionId, new Map([[file.id, serverId]]))
@@ -966,6 +1058,8 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   }
   set((state) => ({ streaming: { ...state.streaming, [sessionId]: controller } }))
   let reply = initial
+  let saved = false
+  let checkpoint: ReturnType<typeof setInterval> | undefined
   let frame = 0
   const flush = () => {
     cancelAnimationFrame(frame)
@@ -975,6 +1069,23 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   streamFlushes.set(sessionId, flush)
 
   try {
+    saved = await persist(sessionId)
+    if (!saved || controller.signal.aborted) {
+      reply = settleReply(reply, 'stopped', Date.now())
+      return
+    }
+    let lastCheckpoint = reply
+    checkpoint = setInterval(() => {
+      if (reply !== lastCheckpoint && !db.hasPendingWrite(sessionId)) {
+        flush()
+        const snapshot = reply
+        void persist(sessionId).then((ok) => {
+          if (ok) {
+            lastCheckpoint = snapshot
+          }
+        })
+      }
+    }, 3000)
     for (let attempt = 0; ; attempt += 1) {
       /** 附件补齐前出错属于上传失败，请求还没有发出 */
       let preparing = true
@@ -988,7 +1099,6 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           : createLatestReminder(useSettings.getState())
         reply = { ...reply, latestReminder }
         updateReply(sessionId, reply)
-        persist(sessionId)
         const messages = toRequestMessages(
           prepared.history,
           prepared.question,
@@ -997,7 +1107,6 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           latestReminder
         )
         const events = streamMessage(
-          useSettings.getState().apiKey ?? '',
           {
             model: initial.model ?? MODEL,
             system: SYSTEM_PROMPT,
@@ -1080,15 +1189,20 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
       }
     }
   } finally {
+    clearInterval(checkpoint)
     titleRequests.delete(controller)
-    streamFlushes.delete(sessionId)
     cancelAnimationFrame(frame)
-    updateReply(sessionId, reply)
-    set((state) => ({
-      streaming: Object.fromEntries(
-        Object.entries(state.streaming).filter(([id]) => id !== sessionId)
-      ),
-    }))
-    persist(sessionId)
+    if (getStreamController(sessionId) === controller) {
+      streamFlushes.delete(sessionId)
+      updateReply(sessionId, reply)
+      set((state) => ({
+        streaming: Object.fromEntries(
+          Object.entries(state.streaming).filter(([id]) => id !== sessionId)
+        ),
+      }))
+      if (saved) {
+        void persist(sessionId)
+      }
+    }
   }
 }

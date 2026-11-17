@@ -1,15 +1,17 @@
 import { useState } from 'react'
-import { IconEditOutline16 } from '../base/icons.js'
-import { useSettings } from '../../services/settings.js'
+import { IconEditOutline16, IconTrashOutline16 } from '../base/icons.js'
+import { useAccount } from '../../services/account.js'
 import { useIsMobile } from '../../app/viewport.js'
 import { IconButton } from '../base/IconButton.js'
+import { Button } from '../base/Button.js'
+import { Modal } from '../base/Modal.js'
 import { useApiKeyForm } from './useApiKeyForm.js'
 import { useTranslate } from '../../i18n/index.js'
 import styles from './Settings.module.css'
 
 /** API Key 的编辑状态：输入框与移动端底部的「确定」按钮共用 */
 export const useApiKeyEditor = () => {
-  const apiKey = useSettings((state) => state.apiKey)
+  const apiKey = useAccount((state) => state.session?.user?.hasApiKey)
   const [editing, setEditing] = useState(false)
   const form = useApiKeyForm(() => setEditing(false))
   return { apiKey, editing, setEditing, form, showInput: !apiKey || editing }
@@ -21,7 +23,8 @@ type ApiKeyEditor = ReturnType<typeof useApiKeyEditor>
 export const ApiKeyField = ({ editor }: { editor: ApiKeyEditor }) => {
   const t = useTranslate()
   const isMobile = useIsMobile()
-  const { apiKey, editing, setEditing, form, showInput } = editor
+  const { apiKey, editing, setEditing, form } = editor
+  const [confirmRemove, setConfirmRemove] = useState(false)
 
   return (
     <div className={styles.cell}>
@@ -29,12 +32,19 @@ export const ApiKeyField = ({ editor }: { editor: ApiKeyEditor }) => {
         <div className={styles.label}>{t('apiKeyStart')}</div>
         {apiKey && !editing ? (
           <div className={styles.apiKeySaved}>
-            <span className={styles.apiKeyMask}>{'*'.repeat(apiKey.length)}</span>
+            <span>{t('apiKeyConfigured')}</span>
             <IconButton
               tone="primary"
               icon={<IconEditOutline16 />}
               tooltip={t('apiKeyEdit')}
+              disabled={form.verifying}
               onClick={() => setEditing(true)}
+            />
+            <IconButton
+              icon={<IconTrashOutline16 />}
+              tooltip={t('apiKeyRemove')}
+              disabled={form.verifying}
+              onClick={() => setConfirmRemove(true)}
             />
           </div>
         ) : (
@@ -77,8 +87,36 @@ export const ApiKeyField = ({ editor }: { editor: ApiKeyEditor }) => {
             ) : null}
           </div>
         )}
-        {showInput && form.error ? <div className={styles.error}>{form.error}</div> : null}
+        {form.error ? (
+          <div className={styles.error} role="alert">
+            {form.error}
+          </div>
+        ) : null}
       </div>
+      {confirmRemove ? (
+        <Modal
+          title={t('apiKeyRemove')}
+          onClose={() => setConfirmRemove(false)}
+          footer={
+            <>
+              <Button variant="outlined" onClick={() => setConfirmRemove(false)}>
+                {t('cancel')}
+              </Button>
+              <Button
+                variant="danger"
+                onClick={() => {
+                  setConfirmRemove(false)
+                  void form.remove()
+                }}
+              >
+                {t('delete')}
+              </Button>
+            </>
+          }
+        >
+          {t('apiKeyRemoveConfirm')}
+        </Modal>
+      ) : null}
     </div>
   )
 }

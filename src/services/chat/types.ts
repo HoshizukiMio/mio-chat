@@ -10,9 +10,9 @@ import type {
 } from '../api/types.js'
 
 /**
- * 消息附件。id 是本地标识（IndexedDB files 表的主键，原件按它存储，所有引用同一 id 的消息共用一份），
- * 导入的附件沿用导出产物里的文件 ID；本地没有原件的附件只展示文件名，不进入请求。
- * serverId 是 Files API 返回的 file_id，导入的数据或尚未上传成功的文件为 null，发送前补传。
+ * 消息附件。原件按账号和 id 存储；同一账号的多个会话可引用同一个原件。
+ * 导入时沿用归档的文件 ID。缺失原件的附件只展示文件名。
+ * serverId 是 DeepSeek Files API 返回的 file_id，可从保存的原件补传。
  */
 export type FileAttachment = {
   id: string

@@ -14,7 +14,7 @@ const enqueueBackup = <T>(run: () => Promise<T>): Promise<T> => {
   return task
 }
 
-const backupFileName = (date: Date) => `deepseek_data-${formatDate(date)}.zip`
+const backupFileName = (date: Date) => `mio-chat-${formatDate(date)}.zip`
 
 /** 导出为历史会话导出格式的 ZIP，可再次导入。 */
 export const exportHistory = (): Promise<{ name: string; blob: Blob }> =>
@@ -47,10 +47,10 @@ export const importHistory = (file: File): Promise<number> =>
   enqueueBackup(async () => {
     const { checkArchiveFormat, importArchive } = await import('./history/importArchive.js')
     await checkArchiveFormat(file)
-    return replaceHistory(() => importArchive(file))
+    return replaceHistory((staging) => importArchive(file, staging))
   })
 
-/** 确认删除后调用：以空历史原子替换全部本地会话与附件，保留 API Key 和其他设置。 */
+/** 确认删除后调用，以空历史替换当前账号的会话与附件。 */
 export const clearHistory = (): Promise<void> =>
   enqueueBackup(async () => {
     await replaceHistory(async () => {})

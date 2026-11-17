@@ -1,251 +1,229 @@
-import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
-import { toSessionSummary, type Session, type SessionSummary } from './types.js'
+import { checkResponse, jsonRequest, MioError, mioFetch } from '../account.js'
+import { createId } from '../../utils/id.js'
+import type { Session, SessionSummary } from './types.js'
 
-/** IndexedDB 存储结构版本；新增或调整存储、索引时递增。 */
-const DB_VERSION = 11
+export type StoredFile = { id: string; blob: Blob }
+type Snapshot = { generation: number; sessions: (SessionSummary & { revision: number })[] }
+type Mutation = { method: string; data: Record<string, unknown>; payload: Record<string, unknown> }
 
-/** 文件原件按附件的本地 id 存储，所有引用同一 id 的消息共用一份；用于缩略图、打开查看，以及没有 serverId 时补传。 */
-export type StoredFile = {
-  id: string
-  blob: Blob
-}
-
-/** 文件引用留在摘要中，删除会话时通过索引判断原件是否仍被引用。 */
-type StoredSessionSummary = SessionSummary & { fileIds: string[] }
-
-interface ChatDB extends DBSchema {
-  /** 当前使用的会话，界面读写都在这里 */
-  sessions: { key: string; value: Session }
-  sessionSummaries: {
-    key: string
-    value: StoredSessionSummary
-    indexes: { fileIds: string }
-  }
-  /** 当前使用的文件原件 */
-  files: { key: string; value: StoredFile }
-  /**
-   * 历史导入的暂存：导入过程中会话与原件只写入这两个存储，`sessions` / `files` 保持不变；
-   * 全部校验通过后在一个事务中替换正式数据并清空暂存，失败时只清空暂存。
-   */
-  sessionsStaging: { key: string; value: Session }
-  filesStaging: { key: string; value: StoredFile }
-}
-
-let dbPromise: Promise<IDBPDatabase<ChatDB>> | null = null
-
-const storedSummary = (session: Session): StoredSessionSummary => ({
-  ...toSessionSummary(session),
-  fileIds: [
-    ...new Set(
-      session.messages.flatMap((message) =>
-        message.role === 'user' ? message.files.map((file) => file.id) : []
-      )
-    ),
-  ],
+const createStorage = () => ({
+  generation: 0,
+  revisions: new Map<string, number>(),
+  writes: new Map<string, Promise<unknown>>(),
+  unconfirmed: new Map<string, Mutation>(),
+  localFiles: new Map<string, Blob>(),
 })
-
-const abortTransaction = (tx: { abort(): void }) => {
-  try {
-    tx.abort()
-  } catch {
-    // 事务已因请求失败中止。
-  }
+let storage = createStorage()
+export const resetStorage = () => {
+  storage = createStorage()
 }
 
-// 每个操作拿到连接后立即创建事务；IndexedDB 按创建顺序执行范围重叠的事务，读取总能看到之前发起的写入。
-const getDB = () =>
-  (dbPromise ??= openDB<ChatDB>('chat-demo', DB_VERSION, {
-    upgrade(db, _oldVersion, _newVersion, tx) {
-      // 初始化当前格式需要的存储与索引，不迁移旧消息。
-      for (const name of ['sessions', 'files', 'sessionsStaging', 'filesStaging'] as const) {
-        if (!db.objectStoreNames.contains(name)) {
-          db.createObjectStore(name, { keyPath: 'id' })
-        }
-      }
-      const summaries = db.objectStoreNames.contains('sessionSummaries')
-        ? tx.objectStore('sessionSummaries')
-        : db.createObjectStore('sessionSummaries', { keyPath: 'id' })
-      if (!summaries.indexNames.contains('fileIds')) {
-        summaries.createIndex('fileIds', 'fileIds', { multiEntry: true })
-      }
-    },
-  }).catch((error: unknown) => {
-    // 打开失败后允许界面重试，避免一直复用已拒绝的 Promise。
-    dbPromise = null
-    throw error
-  }))
+const json = async <T>(path: string, request?: RequestInit) =>
+  (await (await checkResponse(await mioFetch(path, request))).json()) as T
+const sessionPath = (id: string) => `/api/sessions/${encodeURIComponent(id)}`
+const filePath = (id: string) => `/api/assets/${encodeURIComponent(id)}`
+const batchPath = (batch: string) => `/api/history/batches/${encodeURIComponent(batch)}`
 
-export const loadSessionSummaries = async (): Promise<SessionSummary[]> =>
-  (await (await getDB()).getAll('sessionSummaries')).map(toSessionSummary)
-
-export const loadSession = async (id: string): Promise<Session | undefined> =>
-  (await getDB()).get('sessions', id)
-
-export const saveSession = async (session: Session, files: StoredFile[] = []): Promise<void> => {
-  const summary = storedSummary(session)
-  const tx = (await getDB()).transaction(['sessions', 'sessionSummaries', 'files'], 'readwrite')
-  await Promise.all([
-    (async () => {
-      try {
-        for (const file of files) {
-          await tx.objectStore('files').put(file)
-        }
-        await tx.objectStore('sessions').put(session)
-        await tx.objectStore('sessionSummaries').put(summary)
-      } catch (error) {
-        abortTransaction(tx)
-        throw error
-      }
-    })(),
-    tx.done,
-  ])
+const adopt = (snapshot: Snapshot, state: typeof storage) => {
+  state.generation = snapshot.generation
+  state.revisions.clear()
+  return snapshot.sessions.map(({ revision, ...summary }) => {
+    state.revisions.set(summary.id, revision)
+    return summary
+  })
+}
+export const loadSessionSummaries = () => {
+  const state = storage
+  return json<Snapshot>('/api/sessions').then((snapshot) => adopt(snapshot, state))
 }
 
-/** 未打开的会话也可重命名，只读取该会话，原子更新详情和列表。 */
-export const renameSession = async (id: string, title: string): Promise<void> => {
-  const tx = (await getDB()).transaction(['sessions', 'sessionSummaries'], 'readwrite')
-  await Promise.all([
-    (async () => {
-      try {
-        const sessions = tx.objectStore('sessions')
-        const session = await sessions.get(id)
-        if (session) {
-          session.title = title
-          await sessions.put(session)
-          await tx.objectStore('sessionSummaries').put(storedSummary(session))
-        }
-      } catch (error) {
-        abortTransaction(tx)
-        throw error
-      }
-    })(),
-    tx.done,
-  ])
-}
-
-/** 删除会话，仅清理已无会话引用的本地原件；远端文件不删。 */
-export const deleteSession = async (sessionId: string): Promise<void> => {
-  const tx = (await getDB()).transaction(['sessions', 'sessionSummaries', 'files'], 'readwrite')
-  await Promise.all([
-    (async () => {
-      try {
-        const summaries = tx.objectStore('sessionSummaries')
-        const summary = await summaries.get(sessionId)
-        await tx.objectStore('sessions').delete(sessionId)
-        await summaries.delete(sessionId)
-        for (const id of summary?.fileIds ?? []) {
-          if ((await summaries.index('fileIds').count(id)) === 0) {
-            await tx.objectStore('files').delete(id)
-          }
-        }
-      } catch (error) {
-        abortTransaction(tx)
-        throw error
-      }
-    })(),
-    tx.done,
-  ])
-}
-
-const putFiles = async (store: 'files' | 'filesStaging', files: StoredFile[]) => {
-  const tx = (await getDB()).transaction(store, 'readwrite')
-  await Promise.all([...files.map((file) => tx.store.put(file)), tx.done])
-}
-
-export const saveFiles = (files: StoredFile[]): Promise<void> => putFiles('files', files)
-
-export const loadFile = async (id: string): Promise<Blob | undefined> =>
-  (await (await getDB()).get('files', id))?.blob
-
-/** 清空导入暂存：开始导入前清除上次中断（如关闭页面）遗留的数据，导入失败后清除本次写入。 */
-export const clearStaging = async (): Promise<void> => {
-  const tx = (await getDB()).transaction(['sessionsStaging', 'filesStaging'], 'readwrite')
-  await Promise.all([
-    tx.objectStore('sessionsStaging').clear(),
-    tx.objectStore('filesStaging').clear(),
-    tx.done,
-  ])
-}
-
-export const addStagingSession = async (session: Session): Promise<void> => {
-  await (await getDB()).add('sessionsStaging', session)
-}
-
-export const saveStagingFiles = (files: StoredFile[]): Promise<void> =>
-  putFiles('filesStaging', files)
-
-/** 图片位于会话 JSON 之后；全部读完后回填具体 MIME，保留归档给出的 isImage 标识。 */
-export const updateStagingFileTypes = async (types: ReadonlyMap<string, string>): Promise<void> => {
-  const tx = (await getDB()).transaction('sessionsStaging', 'readwrite')
-  await Promise.all([
-    (async () => {
-      for (let cursor = await tx.store.openCursor(); cursor; cursor = await cursor.continue()) {
-        const session = cursor.value
-        let changed = false
-        for (const message of session.messages) {
-          if (message.role !== 'user') {
-            continue
-          }
-          for (const file of message.files) {
-            const type = types.get(file.id) ?? ''
-            if (file.mimeType !== type) {
-              file.mimeType = type
-              changed = true
-            }
-          }
-        }
-        if (changed) {
-          await cursor.update(session)
-        }
-      }
-    })(),
-    tx.done,
-  ])
-}
-
-/**
- * 导入完成后用暂存替换正式数据：同一事务中替换会话、摘要和原件，并清空暂存。
- * 逐条游标复制，同一时间只读取一条记录；事务失败时整体回滚，正式数据不变。
- */
-export const commitStaging = async (): Promise<SessionSummary[]> => {
-  const summaries: SessionSummary[] = []
-  const tx = (await getDB()).transaction(
-    ['sessions', 'sessionSummaries', 'files', 'sessionsStaging', 'filesStaging'],
-    'readwrite'
-  )
-  const move = async (from: 'sessionsStaging' | 'filesStaging', to: 'sessions' | 'files') => {
-    try {
-      const target = tx.objectStore(to)
-      await target.clear()
-      if (to === 'sessions') {
-        await tx.objectStore('sessionSummaries').clear()
-      }
-      for (
-        let cursor = await tx.objectStore(from).openCursor();
-        cursor;
-        cursor = await cursor.continue()
-      ) {
-        await target.put(cursor.value)
-        if (to === 'sessions') {
-          const summary = storedSummary(cursor.value as Session)
-          await tx.objectStore('sessionSummaries').put(summary)
-          summaries.push(toSessionSummary(summary))
-        }
-      }
-      await tx.objectStore(from).clear()
-    } catch (error) {
-      // 同步抛出的错误不会让事务自动回滚，需显式中止，避免只提交清空和部分移入。
-      abortTransaction(tx)
-      throw error
+export const loadSession = async (id: string): Promise<Session | undefined> => {
+  const state = storage
+  await state.writes.get(id)?.catch(() => {})
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (state !== storage) {
+      throw new DOMException('Signed out', 'AbortError')
+    }
+    const response = await mioFetch(sessionPath(id))
+    if (response.status === 404) {
+      return undefined
+    }
+    const { generation, revision, session } = (await (await checkResponse(response)).json()) as {
+      generation: number
+      revision: number
+      session: Session
+    }
+    if (generation !== state.generation) {
+      throw new MioError(409, 'conflict', 'History has changed')
+    }
+    if (revision >= (state.revisions.get(id) ?? 0)) {
+      state.revisions.set(id, revision)
+      return session
     }
   }
-  await Promise.all([move('sessionsStaging', 'sessions'), move('filesStaging', 'files'), tx.done])
-  // 直接返回本次提交的列表，调用方无需在替换成功后再发起可能失败的读取。
-  return summaries
+  throw new MioError(409, 'conflict', 'History has changed')
 }
 
-/** 本地存储失败不打断对话，只在控制台留痕 */
+const upload = async ({ id, blob }: StoredFile, batch?: string) => {
+  const query = batch ? `?batch=${encodeURIComponent(batch)}` : ''
+  await checkResponse(
+    await mioFetch(filePath(id) + query, {
+      method: 'PUT',
+      body: blob,
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-mio-file-type': blob.type,
+      },
+    })
+  )
+}
+
+const write = (
+  id: string,
+  method: string,
+  data: Record<string, unknown>,
+  files: StoredFile[] = []
+) => {
+  const state = storage
+  const generation = state.generation
+  for (const { id: fileId, blob } of files) {
+    state.localFiles.set(fileId, blob)
+  }
+  const current = state.writes.get(id)
+  const task = (current ?? Promise.resolve())
+    .catch(() => {})
+    .then(async () => {
+      const ensureCurrent = () => {
+        if (state !== storage) {
+          throw new DOMException('Signed out', 'AbortError')
+        }
+        if (generation !== state.generation) {
+          throw new MioError(409, 'conflict', 'History has changed')
+        }
+      }
+      const commit = async (mutation: Mutation) => {
+        ensureCurrent()
+        state.unconfirmed.set(id, mutation)
+        try {
+          const { revision } = await json<{ revision: number }>(
+            sessionPath(id),
+            jsonRequest(mutation.method, mutation.data)
+          )
+          state.revisions.set(id, revision)
+          state.unconfirmed.delete(id)
+        } catch (error) {
+          if (error instanceof MioError && error.status < 500) {
+            state.unconfirmed.delete(id)
+          }
+          throw error
+        }
+      }
+      ensureCurrent()
+      const previous = state.unconfirmed.get(id)
+      if (previous) {
+        await commit(previous)
+        if (
+          previous.method === method &&
+          JSON.stringify(previous.payload) === JSON.stringify(data)
+        ) {
+          for (const { id: fileId } of files) {
+            state.localFiles.delete(fileId)
+          }
+          return
+        }
+      }
+      for (const file of files) {
+        ensureCurrent()
+        await upload(file)
+      }
+      const mutation = createId()
+      await commit({
+        method,
+        payload: data,
+        data: { ...data, generation, mutation, revision: state.revisions.get(id) ?? null },
+      })
+      for (const { id: fileId } of files) {
+        state.localFiles.delete(fileId)
+      }
+    })
+    .finally(() => {
+      if (state.writes.get(id) === task) {
+        state.writes.delete(id)
+      }
+    })
+  state.writes.set(id, task)
+  return task
+}
+
+export const hasPendingWrite = (id: string) => storage.writes.has(id)
+export const waitForWrites = () => Promise.allSettled(storage.writes.values())
+export const discardLocalFiles = (files: StoredFile[] = []) => {
+  for (const { id } of files) {
+    storage.localFiles.delete(id)
+  }
+}
+export const saveSession = (session: Session, files?: StoredFile[]) =>
+  write(session.id, 'PUT', { session }, files)
+export const renameSession = (id: string, title: string) => write(id, 'PATCH', { title })
+export const deleteSession = (id: string) => write(id, 'DELETE', {})
+
+export const loadFile = async (id: string): Promise<Blob | undefined> => {
+  const local = storage.localFiles.get(id)
+  if (local) {
+    return local
+  }
+  const response = await mioFetch(filePath(id))
+  if (response.status === 404) {
+    return undefined
+  }
+  const data = await (await checkResponse(response)).blob()
+  return data.slice(0, data.size, response.headers.get('x-mio-file-type') ?? data.type)
+}
+
+export const beginReplacement = async () => {
+  const state = storage
+  const { id } = await json<{ id: string }>('/api/history/batches', { method: 'POST' })
+  const path = batchPath(id)
+  const ensureCurrent = () => {
+    if (state !== storage) {
+      throw new DOMException('Signed out', 'AbortError')
+    }
+  }
+  return {
+    async addStagingSession(session: Session) {
+      ensureCurrent()
+      await checkResponse(
+        await mioFetch(
+          `${path}/sessions/${encodeURIComponent(session.id)}`,
+          jsonRequest('PUT', session)
+        )
+      )
+    },
+    async saveStagingFiles(files: StoredFile[]) {
+      for (const file of files) {
+        ensureCurrent()
+        await upload(file, id)
+      }
+    },
+    async commit() {
+      ensureCurrent()
+      const snapshot = await json<Snapshot>(`${path}/commit`, { method: 'POST' })
+      state.unconfirmed.clear()
+      state.localFiles.clear()
+      return adopt(snapshot, state)
+    },
+    async cancel() {
+      ensureCurrent()
+      await checkResponse(await mioFetch(path, { method: 'DELETE' }))
+    },
+  }
+}
+
+export type HistoryStaging = Awaited<ReturnType<typeof beginReplacement>>
+export const isConflict = (error: unknown) => error instanceof MioError && error.status === 409
 export const reportStorageError = (action: string) => (error: unknown) => {
-  // eslint-disable-next-line no-console
-  console.error(`[storage] ${action} failed`, error)
+  if (!(error instanceof DOMException && error.name === 'AbortError')) {
+    // eslint-disable-next-line no-console
+    console.error(`[storage] ${action} failed`, error)
+  }
 }

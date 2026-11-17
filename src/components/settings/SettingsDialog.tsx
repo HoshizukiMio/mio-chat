@@ -16,6 +16,7 @@ import {
   importHistory,
 } from '../../services/chat/backup.js'
 import { useIsMobile } from '../../app/viewport.js'
+import { logout, useAccount } from '../../services/account.js'
 import { useChatStore } from '../../services/chat/store.js'
 import { regionCodes, getRegionName, provinces } from '../../services/location.js'
 import {
@@ -100,6 +101,7 @@ const SettingsContent = () => {
               <LocaleSetting />
               <TtsVoiceSetting />
               <LocationSetting />
+              <AccountSetting />
             </>
           ) : (
             <>
@@ -264,6 +266,36 @@ const LocationSetting = () => {
             />
           )}
         </div>
+      }
+    />
+  )
+}
+
+const AccountSetting = () => {
+  const t = useTranslate()
+  const username = useAccount((state) => state.session?.user?.username)
+  const [busy, setBusy] = useState(false)
+  const [failed, setFailed] = useState(false)
+  const signOut = async () => {
+    setBusy(true)
+    setFailed(false)
+    try {
+      await logout()
+    } catch {
+      setFailed(true)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <SettingCell
+      label={t('accountUsername')}
+      description={username}
+      status={failed ? { key: 'accountUnavailable', error: true } : null}
+      action={
+        <Button variant="outlined" size="m" disabled={busy} onClick={() => void signOut()}>
+          {t('accountLogout')}
+        </Button>
       }
     />
   )

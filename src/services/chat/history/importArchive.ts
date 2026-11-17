@@ -1,4 +1,4 @@
-import * as db from '../db.js'
+import type { HistoryStaging } from '../db.js'
 import { BackupError, fail } from './errors.js'
 import type { SessionIndexEntry } from './format.js'
 import { INDEX_PATH, MANIFEST_PATH, USER_PATH, parseSessionPath, sessionFilesDir } from './paths.js'
@@ -42,6 +42,9 @@ const imageType = (bytes: Uint8Array): string => {
 }
 
 const readJson = async (entry: ArchiveEntry): Promise<unknown> => {
+  if (entry.size > 32 * 1024 * 1024) {
+    fail('backupIncomplete')
+  }
   const text = await (await readEntry(entry)).text()
   try {
     return JSON.parse(text)
@@ -78,14 +81,14 @@ export const checkArchiveFormat = async (file: File): Promise<void> => {
  * 会话读完立即暂存，只保留图片路径映射；图片全部读完后逐会话回填 MIME，不改变图片身份。
  * 写入导入暂存存储；调用方负责先清空暂存，成功后替换正式数据，失败时清理暂存。
  */
-export const importArchive = async (file: File): Promise<void> => {
+export const importArchive = async (file: File, staging: HistoryStaging): Promise<void> => {
   if (!(await isZipFile(file))) {
     fail('backupUnrecognized')
   }
   const imported = new Set<string>()
   const images = new Map<string, string>()
   /** 已保存的原件：文件 ID → MIME。同一图片出现在多个会话目录时只保存一次。 */
-  const stored = new Map<string, string>()
+  const stored = new Set<string>()
   let manifest = false
   let index: SessionIndexEntry[] | undefined
   let currentSessionId: string | undefined
@@ -95,10 +98,13 @@ export const importArchive = async (file: File): Promise<void> => {
       await skipEntry(entry)
       return
     }
+    if (entry.size > 64 * 1024 * 1024) {
+      fail('backupIncomplete')
+    }
     const data = await readEntry(entry)
     const type = imageType(new Uint8Array(await data.slice(0, 16).arrayBuffer()))
-    await db.saveStagingFiles([{ id, blob: new Blob([data], { type }) }])
-    stored.set(id, type)
+    await staging.saveStagingFiles([{ id, blob: new Blob([data], { type }) }])
+    stored.add(id)
   }
 
   try {
@@ -124,7 +130,7 @@ export const importArchive = async (file: File): Promise<void> => {
         for (const [imagePath, id] of local.images) {
           images.set(imagePath, id)
         }
-        await db.addStagingSession(local.session)
+        await staging.addStagingSession(local.session)
       } else if (path === INDEX_PATH && !index) {
         index = readSessionIndex(await readJson(entry))
       } else if (
@@ -155,5 +161,4 @@ export const importArchive = async (file: File): Promise<void> => {
   ) {
     fail('backupIncomplete')
   }
-  await db.updateStagingFileTypes(stored)
 }
