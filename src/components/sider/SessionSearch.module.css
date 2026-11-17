@@ -1,0 +1,78 @@
+.trigger {
+  gap: 8px;
+  margin-top: 8px;
+  flex-shrink: 0;
+}
+
+.dialog {
+  width: 530px;
+  max-height: calc(100dvh - 36px);
+  overflow: auto;
+}
+
+.field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+}
+
+.field:focus-within {
+  border-color: var(--dsw-alias-brand-primary);
+}
+
+.field input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+}
+
+.results {
+  display: grid;
+  gap: 4px;
+  max-height: min(50dvh, 380px);
+  margin-top: 10px;
+  overflow: auto;
+}
+
+.results p {
+  margin: 8px 0 0;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.result {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.result:hover,
+.result:focus-visible {
+  background: var(--dsw-specific-sidebar-nav-item-hover);
+}
+
+.result span,
+.result small {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.result small {
+  color: var(--dsw-alias-label-secondary);
+}

@@ -5,6 +5,7 @@ import type { RequireAccount } from './auth.ts'
 import { HOUR, MIB, conflict, identifier, invalid, missing, object } from './config.ts'
 import { transaction, type Database } from './database.ts'
 import { getBatch } from './assets.ts'
+import { registerHistoryInsights } from './history-insights.ts'
 
 const maxSessionSize = 32 * MIB
 const timestamp = (input: unknown): input is number => Number.isSafeInteger(input)
@@ -15,6 +16,7 @@ const readSession = (input: unknown, id: string): Session => {
     typeof body.title !== 'string' ||
     !timestamp(body.createdAt) ||
     !timestamp(body.updatedAt) ||
+    ('pinned' in body && typeof body.pinned !== 'boolean') ||
     !Array.isArray(body.messages)
   ) {
     throw invalid('Invalid session')
@@ -73,12 +75,14 @@ export const registerHistory = (
   account: RequireAccount,
   clean: () => void
 ) => {
+  registerHistoryInsights(app, db, account)
   const profile = db.prepare('SELECT generation, history_version FROM users WHERE id=?')
   const current = db.prepare(
     'SELECT revision, mutation, body FROM sessions WHERE user_id=? AND id=?'
   )
   const list = db.prepare(`
-    SELECT id,title,created AS createdAt,updated AS updatedAt,revision
+    SELECT id,title,created AS createdAt,updated AS updatedAt,revision,
+      COALESCE(json_extract(body, '$.pinned'), 0) AS pinned
     FROM sessions WHERE user_id=? AND body IS NOT NULL ORDER BY updated DESC, id
   `)
   const bump = db.prepare('UPDATE users SET history_version=history_version+1 WHERE id=?')
@@ -124,7 +128,7 @@ export const registerHistory = (
   }
   const snapshot = (user: string) => ({
     generation: Number(profile.get(user)?.generation),
-    sessions: list.all(user),
+    sessions: list.all(user).map(({ pinned, ...row }) => ({ ...row, pinned: pinned === 1 })),
   })
   const writeSession = (
     user: string,
@@ -181,22 +185,30 @@ export const registerHistory = (
     const id = identifier(request.params.id)
     const body = object(request.body)
     const title = body.title
-    if (typeof title !== 'string') {
-      throw invalid('Invalid title')
+    const pinned = body.pinned
+    if (
+      (title === undefined && pinned === undefined) ||
+      (title !== undefined && typeof title !== 'string') ||
+      (pinned !== undefined && typeof pinned !== 'boolean')
+    ) {
+      throw invalid('Invalid session metadata')
     }
     return writeSession(user, id, body, (old, revision, mutation) => {
       if (!old?.body) {
         throw missing()
       }
       const session = JSON.parse(old.body) as Session
-      session.title = title
+      session.title = title ?? session.title
+      if (pinned !== undefined) {
+        session.pinned = pinned
+      }
       put.run(
         user,
         id,
         revision,
         mutation,
         JSON.stringify(session),
-        title,
+        session.title,
         session.createdAt,
         session.updatedAt
       )

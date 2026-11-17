@@ -7,6 +7,7 @@ import { canContinueReply } from '../../services/chat/reply.js'
 import { continueReply, regenerateReply } from '../../services/chat/store.js'
 import { stopReadAloud } from '../../services/speech/readAloud.js'
 import type { AssistantMessage as AssistantMessageType } from '../../services/chat/types.js'
+import { readTokenUsage } from '../../services/chat/usage.js'
 import { openSettings } from '../settings/settingsDialogState.js'
 import { IconButton } from '../base/IconButton.js'
 import { Button } from '../base/Button.js'
@@ -16,6 +17,7 @@ import { toggleSearchPanel, useSearchPanel } from '../search/searchPanelState.js
 import { ReadAloudButton } from './ReadAloudButton.js'
 import { CopyButton } from './CopyButton.js'
 import { ReplyArea } from './ReplyArea.js'
+import { TokenUsage } from './TokenUsage.js'
 import { useReplyView } from './useReplyView.js'
 import {
   BranchSwitcher,
@@ -47,6 +49,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   const view = useReplyView(message, streaming)
   const panelEntry = useSearchPanel((state) => state.entry)
   const notice = streaming ? null : describeReply(message)
+  const usage = streaming ? undefined : readTokenUsage(message.usage)
   // 安全拒绝：已下发的思考与正文按协议丢弃，只显示模板答复。
   const refused = message.stopReason === 'refusal'
   const answer = refused ? null : view.answer
@@ -57,7 +60,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   const waiting = streaming && view.steps.length === 0 && !view.answer && !message.thinking
   const summaryEntry = `${message.id}-summary`
   return (
-    <div className={styles.message}>
+    <div className={styles.message} data-message-id={message.id}>
       {refused ? null : (
         <ReplyArea
           message={message}
@@ -137,6 +140,9 @@ export const AssistantMessage = memo(function AssistantMessage({
             )}
           </span>
         </div>
+      ) : null}
+      {usage ? (
+        <TokenUsage usage={usage} model={message.model} timestamp={message.createdAt} />
       ) : null}
       {streaming ? null : (
         <div className={styles.bottom}>

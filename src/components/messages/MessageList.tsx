@@ -5,7 +5,7 @@ import {
   getVisibleMessages,
   type MessageVersions,
 } from '../../services/chat/branches.js'
-import { selectMessageVersion } from '../../services/chat/store.js'
+import { selectMessageVersion, useChatStore } from '../../services/chat/store.js'
 import type { Session } from '../../services/chat/types.js'
 import { closeSearchPanel } from '../search/searchPanelState.js'
 import { AssistantMessage } from './AssistantMessage.js'
@@ -48,6 +48,8 @@ export const MessageList = ({
   const stickyRef = useRef(true)
   const scrollTopRef = useRef(0)
   const restoreScrollRef = useRef<{ messageId: string; top: number } | null>(null)
+  const searchFocus = useChatStore((state) => state.searchFocus)
+  const focused = useRef<typeof searchFocus>(null)
   const messages = getVisibleMessages(session)
   const [previousVersions, setPreviousVersions] = useState(() =>
     buildMessageVersions(session, new Map())
@@ -98,6 +100,24 @@ export const MessageList = ({
     stickyRef.current = true
     scrollToBottom()
   }, [session.id, lastMessageId, scrollToBottom])
+
+  useLayoutEffect(() => {
+    if (!searchFocus || searchFocus === focused.current || searchFocus.sessionId !== session.id) {
+      return
+    }
+    const match = contentRef.current?.querySelector<HTMLElement>(
+      `[data-message-id="${CSS.escape(searchFocus.messageId)}"]`
+    )
+    if (!match) {
+      return
+    }
+    focused.current = searchFocus
+    stickyRef.current = false
+    match.scrollIntoView({ block: 'center' })
+    if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      match.animate([{ opacity: 0.45 }, { opacity: 1 }], { duration: 560 })
+    }
+  }, [searchFocus, session.id, lastMessageId])
 
   useEffect(closeSearchPanel, [session.id, lastMessageId])
 

@@ -1,3 +1,6 @@
+import type { ChatModel } from '../../api/types.js'
+import type { TokenUsage } from '../usage.js'
+
 /**
  * 历史会话导出产物（deepseek_data-*.zip）的类型定义。
  *
@@ -59,6 +62,8 @@ export type ChatMessage = {
   search_enabled: boolean
   /** 沿分支累计的上下文 token */
   accumulated_token_usage: number
+  mio_usage?: TokenUsage
+  mio_model?: ChatModel
   inserted_at: Iso8601Utc
   /** 按发生顺序排列 */
   fragments: Fragment[]

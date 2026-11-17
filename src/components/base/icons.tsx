@@ -404,6 +404,18 @@ export const IconRightUpOutline14 = () => (
   </svg>
 )
 
+export const IconPinOutline16 = () => (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <path
+      d="m9.2 2.4 4.4 4.4-1.8.7-1.5 1.6-.2 2.2-1 1-5.4-5.4 1-1 2.2-.2 1.6-1.5.7-1.8ZM6.5 9.5l-4.1 4.1"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+)
+
 export const IconSearchOutline16 = () => (
   <svg width={16} height={16} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path

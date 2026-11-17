@@ -379,3 +379,111 @@ test('DeepSeek keys stay encrypted at rest and drive stream, attachment and spee
   assert.equal((await call('/api/deepseek/anthropic/v1/messages', 'POST', request)).statusCode, 400)
   assert.deepEqual((await call('/api/account/api-key', 'DELETE')).json(), { hasApiKey: false })
 })
+
+test('search, pins and recorded token totals are scoped to the account', async (t) => {
+  const { app, restart } = await fixture(t)
+  const alice = access(await register(app, 'alice'))
+  const bob = access(await register(app, 'bob'))
+  const firstUsage = {
+    input_tokens: 16466,
+    cache_read_input_tokens: 16467328,
+    cache_creation_input_tokens: 0,
+    output_tokens: 37849,
+  }
+  const secondUsage = {
+    input_tokens: 2,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 3,
+    output_tokens: 5,
+  }
+  const get = (instance: TestApp, who: Login, url: string) => instance.inject({ url, headers: who })
+  const save = (who: Login, body: object, id: string) =>
+    app.inject({
+      method: 'PUT',
+      url: `/api/sessions/${id}`,
+      headers: { ...who, ...headers },
+      payload: { session: body, generation: 0, revision: null, mutation: 'create' },
+    })
+  const one = session('one', 'original')
+  assert.equal(
+    (
+      await save(
+        alice,
+        {
+          ...one,
+          rootMessageId: 'message',
+          messages: [
+            { ...one.messages[0], selectedChildId: 'visible' },
+            {
+              id: 'visible',
+              role: 'assistant',
+              status: 'done',
+              parentId: 'message',
+              createdAt: 101,
+              blocks: [{ type: 'text', text: 'Visible branch' }],
+              usage: secondUsage,
+            },
+            {
+              id: 'hidden',
+              role: 'assistant',
+              status: 'done',
+              parentId: 'message',
+              createdAt: 103,
+              blocks: [{ type: 'text', text: '历史分支 C++ 片段' }],
+              usage: firstUsage,
+            },
+          ],
+        },
+        'one'
+      )
+    ).statusCode,
+    200
+  )
+  assert.equal(
+    (await save(bob, { ...session('private', 'original'), title: '历史分支 C++' }, 'private'))
+      .statusCode,
+    200
+  )
+  const search = (who: Login, query: string) =>
+    get(app, who, `/api/history/search?q=${encodeURIComponent(query)}`)
+  for (const query of ['史', 'c++']) {
+    const result = (await search(alice, query)).json().results
+    assert.equal(result.length, 1)
+    assert.equal(result[0].session.id, 'one')
+    assert.equal(result[0].messageId, 'hidden')
+    assert.match(result[0].snippet, /历史分支/)
+  }
+  assert.equal((await search(alice, 'FIRST DRAFT')).json().results[0].messageId, undefined)
+  assert.equal((await search(alice, '.*')).json().results.length, 0)
+  assert.equal((await search(bob, 'Visible branch')).json().results.length, 0)
+  assert.equal((await get(app, bob, '/api/history/usage')).json().replies, 0)
+  assert.equal((await get(app, alice, '/api/sessions')).json().sessions[0].pinned, false)
+
+  const pin = (instance: TestApp, who: Login, pinned: boolean, revision: number) =>
+    instance.inject({
+      method: 'PATCH',
+      url: '/api/sessions/one',
+      headers: { ...who, ...headers },
+      payload: { pinned, generation: 0, revision, mutation: `pin-${pinned}` },
+    })
+  assert.equal((await pin(app, bob, true, 1)).statusCode, 409)
+  assert.equal((await pin(app, alice, true, 1)).statusCode, 200)
+  assert.equal((await pin(app, alice, false, 1)).statusCode, 409)
+  const restarted = await restart()
+  const detail = (await get(restarted, alice, '/api/sessions/one')).json().session
+  assert.equal(detail.pinned, true)
+  assert.equal(detail.title, one.title)
+  assert.equal(detail.updatedAt, one.updatedAt)
+  assert.equal((await get(restarted, alice, '/api/sessions')).json().sessions[0].pinned, true)
+  assert.deepEqual((await get(restarted, alice, '/api/history/usage')).json(), {
+    replies: 2,
+    usage: {
+      input_tokens: 16468,
+      cache_read_input_tokens: 16467328,
+      cache_creation_input_tokens: 3,
+      output_tokens: 37854,
+    },
+  })
+  assert.equal((await pin(restarted, alice, false, 2)).statusCode, 200)
+  assert.equal((await get(restarted, alice, '/api/sessions')).json().sessions[0].pinned, false)
+})

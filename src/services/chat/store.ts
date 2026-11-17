@@ -12,7 +12,13 @@ import {
 } from '../attachments.js'
 import { useSettings } from '../settings.js'
 import { MioError } from '../account.js'
-import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
+import {
+  appendBranch,
+  getVisibleMessages,
+  normalizeSession,
+  revealMessage,
+  selectVersion,
+} from './branches.js'
 import * as db from './db.js'
 import {
   clearAllDrafts,
@@ -35,6 +41,8 @@ import {
   type FileAttachment,
   type Message,
   type Session,
+  type SessionMetadata,
+  type SessionSearchResult,
   type SessionSummary,
   type UserMessage,
 } from './types.js'
@@ -78,6 +86,7 @@ type ChatState = {
   sessionSaveErrors: Record<string, 'failed' | 'conflict'>
   /** null 表示新对话（欢迎页） */
   activeId: string | null
+  searchFocus: { sessionId: string; messageId: string } | null
   /** 正在生成回复的会话 */
   streaming: Record<string, AbortController>
 }
@@ -91,6 +100,7 @@ const initialChat = (): ChatState => ({
   sessionLoadErrors: {},
   sessionSaveErrors: {},
   activeId: null,
+  searchFocus: null,
   streaming: {},
 })
 export const useChatStore = create<ChatState>(initialChat)
@@ -111,13 +121,16 @@ const getStreamController = (id: string) => {
 }
 
 const sameSummary = (a: SessionSummary, b: SessionSummary) =>
-  a.title === b.title && a.createdAt === b.createdAt && a.updatedAt === b.updatedAt
+  a.title === b.title &&
+  a.createdAt === b.createdAt &&
+  a.updatedAt === b.updatedAt &&
+  (a.pinned === true) === (b.pinned === true)
 
 const sessionAccess = new Map<string, number>()
 const unsavedSessions = new Set<string>()
 /** 保存失败时保留原件，重试成功后才释放。 */
 const pendingFiles = new Map<string, db.StoredFile[]>()
-const pendingRenames = new Map<string, string>()
+const pendingMetadata = new Map<string, SessionMetadata>()
 const deletingSessions = new Set<string>()
 const deletionTasks = new Set<Promise<boolean>>()
 const streamFlushes = new Map<string, () => void>()
@@ -241,8 +254,8 @@ const persist = async (sessionId: string): Promise<boolean> => {
 export const retrySaveSessions = () => {
   if (!get().importingHistory) {
     unsavedSessions.forEach(persist)
-    for (const [id, title] of pendingRenames) {
-      void persistRename(id, title)
+    for (const [id, changes] of pendingMetadata) {
+      void persistMetadata(id, changes)
     }
   }
 }
@@ -371,9 +384,8 @@ const ensureSessionLoaded = (id: string): Promise<void> => {
         throw new MioError(409, 'conflict', 'This session no longer exists')
       }
       const settled = settleInterrupted(normalizeSession(stored))
-      // 读取期间可能已在列表重命名，保留最新元数据，不能让旧读取覆盖它。
-      const currentTitle = pendingRenames.get(id)
-      const session = currentTitle === undefined ? settled : { ...settled, title: currentTitle }
+      const changes = pendingMetadata.get(id)
+      const session = changes ? { ...settled, ...changes } : settled
       touchSession(id)
       set((state) => ({
         sessionCache: { ...state.sessionCache, [id]: session },
@@ -464,7 +476,7 @@ export const replaceHistory = async (
     sessionAccess.clear()
     unsavedSessions.clear()
     pendingFiles.clear()
-    pendingRenames.clear()
+    pendingMetadata.clear()
     clearAllDrafts()
     resetUploads()
     set({
@@ -475,6 +487,7 @@ export const replaceHistory = async (
       sessionLoadErrors: {},
       sessionSaveErrors: {},
       activeId: null,
+      searchFocus: null,
     })
     return summaries.length
   } finally {
@@ -502,7 +515,7 @@ export const resetChat = () => {
   sessionLoads.clear()
   unsavedSessions.clear()
   pendingFiles.clear()
-  pendingRenames.clear()
+  pendingMetadata.clear()
   deletingSessions.clear()
   deletionTasks.clear()
   initTask = undefined
@@ -512,19 +525,19 @@ export const resetChat = () => {
   set(initialChat())
 }
 
-const persistRename = async (id: string, title: string) => {
+const persistMetadata = async (id: string, changes: SessionMetadata) => {
   if (get().sessionSaveErrors[id] === 'conflict') {
     return
   }
   const epoch = historyEpoch
   try {
-    await db.renameSession(id, title)
-    if (epoch === historyEpoch && pendingRenames.get(id) === title) {
-      pendingRenames.delete(id)
+    await db.updateSessionMetadata(id, changes)
+    if (epoch === historyEpoch && pendingMetadata.get(id) === changes) {
+      pendingMetadata.delete(id)
       clearSaveError(id)
     }
   } catch (error) {
-    if (epoch === historyEpoch && pendingRenames.get(id) === title) {
+    if (epoch === historyEpoch && pendingMetadata.get(id) === changes) {
       saveError(id, error)
     }
   }
@@ -532,7 +545,7 @@ const persistRename = async (id: string, title: string) => {
 
 export const newChat = () => {
   if (!get().importingHistory) {
-    set({ activeId: null })
+    set({ activeId: null, searchFocus: null })
     trimSessionCache()
   }
 }
@@ -540,33 +553,82 @@ export const newChat = () => {
 export const selectSession = (id: string) => {
   if (!get().importingHistory && get().sessions.some((session) => session.id === id)) {
     touchSession(id)
-    set({ activeId: id })
+    set({ activeId: id, searchFocus: null })
     void ensureSessionLoaded(id)
     trimSessionCache()
   }
 }
 
-export const renameSession = (id: string, title: string) => {
+export const selectSearchResult = async (result: SessionSearchResult) => {
+  if (get().importingHistory) {
+    return
+  }
+  const { id } = result.session
+  if (!get().sessions.some((summary) => summary.id === id)) {
+    set((state) => ({ sessions: sortSessions([...state.sessions, result.session]) }))
+  }
+  const cached = getSession(id)
+  if (
+    result.messageId &&
+    cached &&
+    !cached.messages.some((message) => message.id === result.messageId) &&
+    !unsavedSessions.has(id) &&
+    !pendingMetadata.has(id) &&
+    !getStreamController(id)
+  ) {
+    set((state) => ({
+      sessionCache: Object.fromEntries(
+        Object.entries(state.sessionCache).filter(([key]) => key !== id)
+      ),
+    }))
+  }
+  selectSession(id)
+  if (!result.messageId) {
+    return
+  }
+  const focus = { sessionId: id, messageId: result.messageId }
+  set({ searchFocus: focus })
+  await ensureSessionLoaded(id)
+  const session = getSession(id)
+  if (get().searchFocus !== focus || !session) {
+    return
+  }
+  if (
+    getStreamController(id) &&
+    !getVisibleMessages(session).some((message) => message.id === focus.messageId)
+  ) {
+    await waitForIdle(id)
+  }
+  if (get().searchFocus === focus && !get().importingHistory) {
+    updateSession(id, (current) => revealMessage(current, focus.messageId))
+  }
+}
+
+const changeSessionMetadata = (id: string, changes: SessionMetadata) => {
   if (get().importingHistory || deletingSessions.has(id)) {
     return
   }
   const controller = getStreamController(id)
-  if (controller) {
+  if (controller && changes.title !== undefined) {
     titleRequests.delete(controller)
   }
   if (getSession(id)) {
-    updateSession(id, (session) => ({ ...session, title }))
-    persist(id)
+    updateSession(id, (session) => ({ ...session, ...changes }))
+    void persist(id)
   } else {
     set((state) => ({
       sessions: state.sessions.map((session) =>
-        session.id === id ? { ...session, title } : session
+        session.id === id ? { ...session, ...changes } : session
       ),
     }))
-    pendingRenames.set(id, title)
-    void persistRename(id, title)
+    const pending = { ...pendingMetadata.get(id), ...changes }
+    pendingMetadata.set(id, pending)
+    void persistMetadata(id, pending)
   }
 }
+export const renameSession = (id: string, title: string) => changeSessionMetadata(id, { title })
+export const setSessionPinned = (id: string, pinned: boolean) =>
+  changeSessionMetadata(id, { pinned })
 
 /**
  * 删除会话；本地原件仅在没有其他会话引用时清理。远端文件不删：导入、编辑、重新生成都会复用同一个附件，
@@ -600,7 +662,7 @@ const removeSessionData = async (id: string): Promise<boolean> => {
     unsavedSessions.delete(id)
     db.discardLocalFiles(pendingFiles.get(id))
     pendingFiles.delete(id)
-    pendingRenames.delete(id)
+    pendingMetadata.delete(id)
     clearDraft(id)
     set((state) => ({
       sessions: state.sessions.filter((session) => session.id !== id),
@@ -614,6 +676,7 @@ const removeSessionData = async (id: string): Promise<boolean> => {
         Object.entries(state.sessionSaveErrors).filter(([key]) => key !== id)
       ),
       activeId: state.activeId === id ? null : state.activeId,
+      searchFocus: state.searchFocus?.sessionId === id ? null : state.searchFocus,
     }))
     return true
   } catch (error) {
@@ -1133,7 +1196,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             updateSession(sessionId, (session) => (session.title ? session : { ...session, title }))
             titleRequests.delete(controller)
           }
-          reply = applyEvent(reply, event, Date.now(), blockIndexes)
+          reply = applyEvent(reply, event, Date.now(), blockIndexes, initial.usage)
           if (document.visibilityState === 'hidden') {
             flush()
           } else {

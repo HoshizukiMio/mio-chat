@@ -1,6 +1,7 @@
 import { checkResponse, jsonRequest, MioError, mioFetch } from '../account.js'
 import { createId } from '../../utils/id.js'
-import type { Session, SessionSummary } from './types.js'
+import type { Session, SessionMetadata, SessionSearchResult, SessionSummary } from './types.js'
+import type { AccountUsage } from './usage.js'
 
 export type StoredFile = { id: string; blob: Blob }
 type Snapshot = { generation: number; sessions: (SessionSummary & { revision: number })[] }
@@ -164,8 +165,15 @@ export const discardLocalFiles = (files: StoredFile[] = []) => {
 }
 export const saveSession = (session: Session, files?: StoredFile[]) =>
   write(session.id, 'PUT', { session }, files)
-export const renameSession = (id: string, title: string) => write(id, 'PATCH', { title })
+export const updateSessionMetadata = (id: string, data: SessionMetadata) => write(id, 'PATCH', data)
 export const deleteSession = (id: string) => write(id, 'DELETE', {})
+export const searchSessions = (query: string, signal: AbortSignal) =>
+  json<{ results: SessionSearchResult[]; more: boolean }>(
+    `/api/history/search?q=${encodeURIComponent(query)}`,
+    { signal }
+  )
+export const loadAccountUsage = (signal: AbortSignal) =>
+  json<AccountUsage>('/api/history/usage', { signal })
 
 export const loadFile = async (id: string): Promise<Blob | undefined> => {
   const local = storage.localFiles.get(id)

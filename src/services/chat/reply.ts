@@ -3,6 +3,7 @@ import type {
   FileBlockParam,
   MessageParam,
   MessageStreamEvent,
+  MessageUsage,
   OutputBlockStart,
   TextBlockParam,
 } from '../api/types.js'
@@ -14,6 +15,7 @@ import type {
   ReplyStatus,
   UserMessage,
 } from './types.js'
+import { addUsage } from './usage.js'
 
 /**
  * 文件按 Files API 的 file_id（附件的 serverId）引用：图片用 image 块，其余用 document 块。
@@ -73,13 +75,12 @@ export const applyEvent = (
   reply: AssistantMessage,
   event: MessageStreamEvent,
   now: number,
-  blockIndexes: Map<number, number>
+  blockIndexes: Map<number, number>,
+  priorUsage?: MessageUsage
 ): AssistantMessage => {
   const next: AssistantMessage =
     reply.status === 'streaming' ? reply : { ...reply, status: 'streaming' }
   switch (event.type) {
-    case 'message_start':
-      return { ...next, usage: event.message.usage ?? next.usage }
     case 'content_block_start': {
       blockIndexes.delete(event.index)
       const block = toReplyBlock(event.content_block, now)
@@ -129,7 +130,10 @@ export const applyEvent = (
         ...next,
         stopReason: event.delta.stop_reason,
         stopDetails: event.delta.stop_details,
-        usage: event.usage ?? next.usage,
+        usage:
+          event.usage && priorUsage
+            ? { ...event.usage, ...addUsage(priorUsage, event.usage) }
+            : (event.usage ?? next.usage),
       }
     default:
       return next
@@ -185,8 +189,7 @@ export const canContinueReply = (reply: AssistantMessage): boolean => {
     return false
   }
   return (
-    reply.status === 'stopped' ||
-    (reply.status === 'done' && reply.stopReason === 'max_tokens')
+    reply.status === 'stopped' || (reply.status === 'done' && reply.stopReason === 'max_tokens')
   )
 }
 

@@ -1,4 +1,5 @@
 import { BackupError, fail } from './errors.js'
+import { readTokenUsage } from '../usage.js'
 import {
   EXPORT_FORMAT_VERSION,
   type ChatMessage,
@@ -215,6 +216,11 @@ const message: Read<ChatMessage> = (value) => {
     thinking_enabled: boolean(item.thinking_enabled),
     search_enabled: boolean(item.search_enabled),
     accumulated_token_usage: count(item.accumulated_token_usage),
+    mio_usage: readTokenUsage(item.mio_usage),
+    mio_model:
+      item.mio_model === 'deepseek-flash' || item.mio_model === 'deepseek-v4-pro'
+        ? item.mio_model
+        : undefined,
     inserted_at: time(item.inserted_at),
     fragments: list(fragment)(item.fragments).filter((item): item is Fragment => item !== null),
   }
@@ -242,7 +248,7 @@ export const readSessionIndex: Read<SessionIndexEntry[]> = list((value) => {
   return {
     id: sessionId(item.id),
     title: nullable(string)(item.title),
-    pinned: false,
+    pinned: item.pinned === true,
     message_count: count(item.message_count),
     inserted_at: time(item.inserted_at),
     updated_at: time(item.updated_at),
@@ -254,7 +260,7 @@ export const readSessionFile: Read<SessionFile> = (value) => {
   return {
     id: sessionId(item.id),
     title: nullable(string)(item.title),
-    pinned: false,
+    pinned: item.pinned === true,
     current_message_id: count(item.current_message_id),
     inserted_at: time(item.inserted_at),
     updated_at: time(item.updated_at),

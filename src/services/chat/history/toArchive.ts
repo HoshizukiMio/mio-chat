@@ -250,6 +250,12 @@ export const toSessionFile = (original: Session, exportImage: ExportImage): Sess
       thinking_enabled: reply?.thinking ?? false,
       search_enabled: reply?.search ?? false,
       accumulated_token_usage: message.role === 'user' ? 0 : contextTokens(message),
+      ...(message.role === 'assistant' && message.usage
+        ? {
+            mio_usage: message.usage,
+            mio_model: message.model ?? undefined,
+          }
+        : {}),
       inserted_at: iso(message.createdAt),
       fragments:
         message.role === 'user' ? userFragments(message, exportImage) : assistantFragments(message),
@@ -259,7 +265,7 @@ export const toSessionFile = (original: Session, exportImage: ExportImage): Sess
   return {
     id: session.id,
     title: session.title || null,
-    pinned: false,
+    pinned: session.pinned === true,
     // 格式要求非空；空会话没有消息可指向，写 0。
     current_message_id: current ? id(current) : 0,
     inserted_at: iso(session.createdAt),
@@ -271,7 +277,7 @@ export const toSessionFile = (original: Session, exportImage: ExportImage): Sess
 export const toIndexEntry = (file: SessionFile): SessionIndexEntry => ({
   id: file.id,
   title: file.title,
-  pinned: false,
+  pinned: file.pinned,
   message_count: file.messages.length,
   inserted_at: file.inserted_at,
   updated_at: file.updated_at,

@@ -115,3 +115,28 @@ export const selectVersion = (original: Session, messageId: string): Session => 
     ),
   }
 }
+
+/** 打开搜索命中所处的路径，保留目标节点选择的后续分支。 */
+export const revealMessage = (session: Session, messageId: string): Session => {
+  if (getVisibleMessages(session).some((message) => message.id === messageId)) {
+    return session
+  }
+  const byId = new Map(session.messages.map((message) => [message.id, message]))
+  const children = new Map<string, string>()
+  let message = byId.get(messageId)
+  while (message?.parentId && !children.has(message.parentId)) {
+    children.set(message.parentId, message.id)
+    message = byId.get(message.parentId)
+  }
+  if (!message || message.parentId !== null) {
+    return session
+  }
+  return {
+    ...session,
+    rootMessageId: message.id,
+    messages: session.messages.map((item) => {
+      const child = children.get(item.id)
+      return child && item.selectedChildId !== child ? { ...item, selectedChildId: child } : item
+    }),
+  }
+}
